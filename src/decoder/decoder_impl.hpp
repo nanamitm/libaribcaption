@@ -110,6 +110,9 @@ private:
     bool replace_msz_fullwidth_ascii_ = true;
     bool replace_msz_fullwidth_ja_ = true;
 
+    std::unordered_map<uint32_t, uint32_t> replace_fullwidth_ascii_map_;
+    std::unordered_map<uint32_t, uint32_t> replace_fullwidth_ja_map_;
+
     std::vector<LanguageInfo> language_infos_;
     uint32_t current_iso6392_language_code_ = 0;
     int prev_dgi_group_ = -1;

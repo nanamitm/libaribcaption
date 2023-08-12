@@ -1325,6 +1325,39 @@ bool DecoderImpl::HandleUTF8(const uint8_t* data, size_t remain_bytes, size_t* b
             PushDRCSCharacter(ucs4, iter->second);
         }
     } else {
+        if ((replace_msz_fullwidth_ascii_ || replace_msz_fullwidth_ja_) &&
+            char_horizontal_scale_ * 2 == char_vertical_scale_) {
+            // Create fullwidth -> halfwidth maps
+            if (replace_fullwidth_ascii_map_.empty()) {
+                for (size_t i = 0; i < std::size(kAlphanumericTable_Halfwidth); i++) {
+                    replace_fullwidth_ascii_map_.emplace(kAlphanumericTable_Fullwidth[i], kAlphanumericTable_Halfwidth[i]);
+                }
+                replace_fullwidth_ascii_map_.emplace(0x3000, 0x0020);
+            }
+            if (replace_fullwidth_ja_map_.empty()) {
+                for (size_t i = 0; i < std::size(kKanaSymbolsTable_Halfwidth); i++) {
+                    uint32_t u = kHiraganaTable[std::size(kHiraganaTable) - std::size(kKanaSymbolsTable_Halfwidth) + i];
+                    replace_fullwidth_ja_map_.emplace(u, kKanaSymbolsTable_Halfwidth[i]);
+                }
+                for (size_t i = 0; i < std::size(kKanjiSymbolsTable_Halfwidth); i++) {
+                    if (replace_fullwidth_ascii_map_.count(kKanjiTable[i]) == 0) {
+                        replace_fullwidth_ja_map_.emplace(kKanjiTable[i], kKanjiSymbolsTable_Halfwidth[i]);
+                    }
+                }
+            }
+            if (replace_msz_fullwidth_ascii_) {
+                auto iter = replace_fullwidth_ascii_map_.find(ucs4);
+                if (iter != replace_fullwidth_ascii_map_.end()) {
+                    ucs4 = iter->second;
+                }
+            }
+            if (replace_msz_fullwidth_ja_) {
+                auto iter = replace_fullwidth_ja_map_.find(ucs4);
+                if (iter != replace_fullwidth_ja_map_.end()) {
+                    ucs4 = iter->second;
+                }
+            }
+        }
         PushCharacter(ucs4);
     }
 
