@@ -28,6 +28,7 @@
 #include "decoder/b24_conv_tables.hpp"
 #include "decoder/b24_drcs_conv.hpp"
 #include "decoder/b24_gaiji_table.hpp"
+#include "decoder/b24_jisx0213_table.hpp"
 #include "decoder/b24_macros.hpp"
 #include "decoder/decoder_impl.hpp"
 
@@ -1222,7 +1223,22 @@ bool DecoderImpl::HandleGLGR(const uint8_t* data, size_t remain_bytes, size_t* b
         uint32_t ucs4 = 0;
         uint32_t pua = 0;
 
-        if (ku < gaiji_begin_ku) {
+        // The two "JIS compatible Kanji" sets are JIS X 0213:2004 plane 1 and plane 2. kKanjiTable
+        // holds plane 1 rows 1-84, so those stay below with the half-width substitutions that go
+        // with them. The rest is not in that table: rows 85-94 of plane 1 are level 3/4 Kanji, where
+        // the Kanji set has the ARIB additional symbols instead, and plane 2 is another plane
+        // entirely. Reading either out of the additional symbol table turns a Kanji into an
+        // unrelated symbol - kuten 91-6 of plane 1 is a Kanji, and came out as U+2613 SALTIRE.
+        const uint32_t* jis_x0213_table = nullptr;
+        if (entry->graphics_set == GraphicSet::kJIS_X0213_2004_Kanji_1 && ku >= gaiji_begin_ku) {
+            jis_x0213_table = kJISX0213Plane1Table;
+        } else if (entry->graphics_set == GraphicSet::kJIS_X0213_2004_Kanji_2) {
+            jis_x0213_table = kJISX0213Plane2Table;
+        }
+
+        if (jis_x0213_table) {
+            ucs4 = jis_x0213_table[ku * 94 + ten];
+        } else if (ku < gaiji_begin_ku) {
             uint32_t index = ku * 94 + ten;
             ucs4 = kKanjiTable[index];
             // If [request replace MSZ fullwidth Japanese] && [under MSZ mode]

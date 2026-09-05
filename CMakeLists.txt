@@ -193,6 +193,7 @@ add_library(aribcaption
         src/decoder/b24_drcs_conv.cpp
         src/decoder/b24_drcs_conv.hpp
         src/decoder/b24_gaiji_table.hpp
+        src/decoder/b24_jisx0213_table.hpp
         src/decoder/b24_macros.hpp
         src/decoder/decoder.cpp
         src/decoder/decoder_capi.cpp
