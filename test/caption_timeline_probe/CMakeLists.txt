@@ -20,7 +20,7 @@
 # against mmts-dsfilter's own subtitle schedule dump ("Tool A" / "Tool B"
 # subtitle timing verification).
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.28)
 
 find_path(AVCODEC_INCLUDE_DIR libavcodec/avcodec.h)
 find_library(AVCODEC_LIBRARY avcodec)
