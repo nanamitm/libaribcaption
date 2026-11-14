@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <string_view>
 #include "base/floating_helper.hpp"
 #include "base/scoped_holder.hpp"
 #include "base/unicode_helper.hpp"
@@ -55,8 +56,11 @@ bool TextRendererFreetype::Initialize() {
 }
 
 void TextRendererFreetype::SetLanguage(uint32_t iso6392_language_code) {
-    (void)iso6392_language_code;
-    // No-OP
+    if (iso6392_language_code_ != iso6392_language_code) {
+        // Font provider resolves font families (e.g. sans-serif) per language, reset loaded faces
+        ResetFontFaces();
+    }
+    iso6392_language_code_ = iso6392_language_code;
 }
 
 bool TextRendererFreetype::SetFontFamily(const std::vector<std::string>& font_family) {
@@ -65,20 +69,23 @@ bool TextRendererFreetype::SetFontFamily(const std::vector<std::string>& font_fa
     }
 
     if (!font_family_.empty() && font_family_ != font_family) {
-        // Reset Freetype faces
-        main_face_.Reset();
-        fallback_face_.Reset();
-        main_face_data_.clear();
-        fallback_face_data_.clear();
-        main_baseline_cache_.clear();
-        fallback_baseline_cache_.clear();
-        main_halfwidth_subst_map_.reset();
-        fallback_halfwidth_subst_map_.reset();
-        main_face_index_ = 0;
+        ResetFontFaces();
     }
 
     font_family_ = font_family;
     return true;
+}
+
+void TextRendererFreetype::ResetFontFaces() {
+    main_face_.Reset();
+    fallback_face_.Reset();
+    main_face_data_.clear();
+    fallback_face_data_.clear();
+    main_baseline_cache_.clear();
+    fallback_baseline_cache_.clear();
+    main_halfwidth_subst_map_.reset();
+    fallback_halfwidth_subst_map_.reset();
+    main_face_index_ = 0;
 }
 
 void TextRendererFreetype::SetReplaceMSZHalfWidthGlyph(bool replace) {
@@ -385,7 +392,7 @@ Bitmap TextRendererFreetype::FTBitmapToColoredBitmap(const FT_Bitmap& ft_bmp, Co
     return bitmap;
 }
 
-static bool MatchFontFamilyName(FT_Face face, const std::string& family_name) {
+static bool MatchFontFamilyName(FT_Face face, std::string_view family_name) {
     FT_UInt sfnt_name_count = FT_Get_Sfnt_Name_Count(face);
 
     for (FT_UInt i = 0; i < sfnt_name_count; i++) {
@@ -396,15 +403,17 @@ static bool MatchFontFamilyName(FT_Face face, const std::string& family_name) {
         }
 
         if (sfnt_name.name_id == TT_NAME_ID_FONT_FAMILY || sfnt_name.name_id == TT_NAME_ID_FULL_NAME) {
-            std::string name_str;
             if (sfnt_name.platform_id == TT_PLATFORM_MICROSOFT) {
-                name_str = utf::ConvertUTF16BEToUTF8(reinterpret_cast<uint16_t*>(sfnt_name.string),
-                                                     sfnt_name.string_len / 2);
+                std::string name_str = utf::ConvertUTF16BEToUTF8(reinterpret_cast<uint16_t*>(sfnt_name.string),
+                                                                 sfnt_name.string_len / 2);
+                if (name_str == family_name) {
+                    return true;
+                }
             } else {
-                name_str = std::string(sfnt_name.string, sfnt_name.string + sfnt_name.string_len);
-            }
-            if (name_str == family_name) {
-                return true;
+                std::string_view name_str(reinterpret_cast<const char*>(sfnt_name.string), sfnt_name.string_len);
+                if (name_str == family_name) {
+                    return true;
+                }
             }
         }
     }

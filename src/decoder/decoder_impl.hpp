@@ -78,6 +78,10 @@ private:
     [[nodiscard]]
     bool IsRubyMode() const;
     [[nodiscard]]
+    bool IsMiddleSizeMode() const;
+    [[nodiscard]]
+    bool IsSmallSizeMode() const;
+    [[nodiscard]]
     int section_width() const;
     [[nodiscard]]
     int section_height() const;
@@ -85,6 +89,7 @@ private:
     void SetAbsoluteActiveCoordinateDot(int x, int y);
     void MoveRelativeActivePos(int x, int y);
     void MoveActivePosToNewline();
+    void ApplyPendingWrap();
 public:
     DecoderImpl(const DecoderImpl&) = delete;
     DecoderImpl(DecoderImpl&&) = delete;
@@ -143,6 +148,7 @@ private:
     bool active_pos_inited_ = false; // Active position is inited
     int active_pos_x_ = 0;           // Active position base point x
     int active_pos_y_ = 0;           // Active position base point y (section's bottom left corner + 1 dot)
+    bool active_pos_pending_wrap_ = false;  // Active position reached the right edge, wrapping is deferred
 
     int char_width_ = 36;            // indicated by SSM
     int char_height_ = 36;           // indicated by SSM
