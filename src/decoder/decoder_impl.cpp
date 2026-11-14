@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cstring>
 #include <cmath>
+#include "base/floating_helper.hpp"
 #include "base/logger.hpp"
 #include "base/md5_helper.hpp"
 #include "base/utf_helper.hpp"
@@ -32,6 +33,8 @@
 #include "decoder/decoder_impl.hpp"
 
 namespace aribcaption::internal {
+
+static constexpr float kCharScaleEpsilon = 0.01f;
 
 DecoderImpl::DecoderImpl(Context& context) : log_(GetContextLogger(context)) {}
 
@@ -346,6 +349,7 @@ void DecoderImpl::ResetInternalState() {
     active_pos_inited_ = false;
     active_pos_x_ = 0;
     active_pos_y_ = 0;
+    active_pos_pending_wrap_ = false;
 
     if (active_encoding_ == EncodingScheme::kABNT_NBR_15606_1_Latin) {
         // Latin language: Use 1/2 x 1 middle size (MSZ) as default
@@ -855,7 +859,7 @@ bool DecoderImpl::HandleC0(const uint8_t* data, size_t remain_bytes, size_t* byt
         case C0::SP:   // Space character
             if (active_encoding_ == EncodingScheme::kABNT_NBR_15606_1_Latin ||
                     active_encoding_ == EncodingScheme::kARIB_STD_B24_UTF8 ||
-                    (replace_msz_fullwidth_ascii_ && char_horizontal_scale_ * 2 == char_vertical_scale_)) {
+                    (replace_msz_fullwidth_ascii_ && IsMiddleSizeMode())) {
                 PushCharacter(0x0020);  // Space (Basic Latin)
             } else {
                 PushCharacter(0x3000);  // Ideographic Space (CJK)
@@ -1268,9 +1272,7 @@ bool DecoderImpl::HandleGLGR(const uint8_t* data, size_t remain_bytes, size_t* b
                entry->graphics_set == GraphicSet::kProportionalHiragana) {
         uint32_t index = (uint32_t)ch - 0x21;
         uint32_t ucs4 = kHiraganaTable[index];
-        if (ch >= 0x79 &&
-            replace_msz_fullwidth_ja_ &&
-            char_horizontal_scale_ * 2 == char_vertical_scale_) {
+        if (ch >= 0x79 && replace_msz_fullwidth_ja_ && IsMiddleSizeMode()) {
             ucs4 = kKanaSymbolsTable_Halfwidth[ch - 0x79];
         }
         PushCharacter(ucs4);
@@ -1279,9 +1281,7 @@ bool DecoderImpl::HandleGLGR(const uint8_t* data, size_t remain_bytes, size_t* b
                entry->graphics_set == GraphicSet::kProportionalKatakana) {
         uint32_t index = (uint32_t)ch - 0x21;
         uint32_t ucs4 = kKatakanaTable[index];
-        if (ch >= 0x79 &&
-            replace_msz_fullwidth_ja_ &&
-            char_horizontal_scale_ * 2 == char_vertical_scale_) {
+        if (ch >= 0x79 && replace_msz_fullwidth_ja_ && IsMiddleSizeMode()) {
             ucs4 = kKanaSymbolsTable_Halfwidth[ch - 0x79];
         }
         PushCharacter(ucs4);
@@ -1289,8 +1289,7 @@ bool DecoderImpl::HandleGLGR(const uint8_t* data, size_t remain_bytes, size_t* b
     } else if (entry->graphics_set == GraphicSet::kJIS_X0201_Katakana) {
         uint32_t index = (uint32_t)ch - 0x21;
         uint32_t ucs4 = kJISX0201KatakanaTable[index];
-        if (replace_msz_fullwidth_ja_ &&
-            char_horizontal_scale_ * 2 == char_vertical_scale_) {
+        if (replace_msz_fullwidth_ja_ && IsMiddleSizeMode()) {
             ucs4 = kJISX0201KatakanaTable_Halfwidth[index];
         }
         PushCharacter(ucs4);
@@ -1310,14 +1309,14 @@ bool DecoderImpl::HandleGLGR(const uint8_t* data, size_t remain_bytes, size_t* b
             uint32_t index = ku * 94 + ten;
             ucs4 = kKanjiTable[index];
             // If [request replace MSZ fullwidth Japanese] && [under MSZ mode]
-            if (replace_msz_fullwidth_ja_ && char_horizontal_scale_ * 2 == char_vertical_scale_) {
+            if (replace_msz_fullwidth_ja_ && IsMiddleSizeMode()) {
                 // Replace symbols used in Japanese (CJK) paragraph, etc. into halfwidth characters
                 if (ku < 2) {
                     ucs4 = kKanjiSymbolsTable_Halfwidth[index];
                 }
             }
             // If [request replace MSZ fullwidth ASCII] && [under MSZ mode]
-            if (replace_msz_fullwidth_ascii_ && char_horizontal_scale_ * 2 == char_vertical_scale_) {
+            if (replace_msz_fullwidth_ascii_ && IsMiddleSizeMode()) {
                 // If [ucs4 is Ideographic Space or Fullwidth alphanumeric]
                 // Replace Fullwidth alphanumerics with Halfwidth alphanumerics
                 if (ucs4 == 0x3000 || (ucs4 >= 0xFF01 && ucs4 <= 0xFF5E)) {
@@ -1343,7 +1342,7 @@ bool DecoderImpl::HandleGLGR(const uint8_t* data, size_t remain_bytes, size_t* b
         uint32_t ucs4 = 0;
         if (active_encoding_ == EncodingScheme::kABNT_NBR_15606_1_Latin) {
             ucs4 = kAlphanumericTable_Latin[index];
-        } else if (replace_msz_fullwidth_ascii_ && char_horizontal_scale_ * 2 == char_vertical_scale_) {
+        } else if (replace_msz_fullwidth_ascii_ && IsMiddleSizeMode()) {
             ucs4 = kAlphanumericTable_Halfwidth[index];
         } else {
             ucs4 = kAlphanumericTable_Fullwidth[index];
@@ -1456,6 +1455,8 @@ void DecoderImpl::PushCharacter(uint32_t ucs4, uint32_t pua) {
     caption_char.codepoint = ucs4;
     caption_char.pua_codepoint = pua;
 
+    ApplyPendingWrap();
+
     size_t u8count = utf::UTF8AppendCodePoint(caption_char.u8str, ucs4);
     caption_char.u8str[u8count] = '\0';
 
@@ -1469,6 +1470,8 @@ void DecoderImpl::PushCharacter(uint32_t ucs4, uint32_t pua) {
 
 void DecoderImpl::PushDRCSCharacter(uint32_t code, DRCS& drcs) {
     CaptionChar caption_char;
+
+    ApplyPendingWrap();
 
     if (drcs.alternative_text.empty()) {
         caption_char.type = CaptionCharType::kDRCS;
@@ -1575,11 +1578,20 @@ bool DecoderImpl::IsRubyMode() const {
     if (active_encoding_ != EncodingScheme::kARIB_STD_B24_JIS) {
         return false;
     }
-    if ((char_horizontal_scale_ == 0.5f && char_vertical_scale_ == 0.5f) ||
+    if (IsSmallSizeMode() ||
             (profile_ == Profile::kProfileA && char_width_ == 18 && char_height_ == 18)) {
         return true;
     }
     return false;
+}
+
+bool DecoderImpl::IsMiddleSizeMode() const {
+    return floating::AlmostEquals(char_horizontal_scale_ * 2.0f, char_vertical_scale_, kCharScaleEpsilon);
+}
+
+bool DecoderImpl::IsSmallSizeMode() const {
+    return floating::AlmostEquals(char_horizontal_scale_, 0.5f, kCharScaleEpsilon) &&
+           floating::AlmostEquals(char_vertical_scale_, 0.5f, kCharScaleEpsilon);
 }
 
 int DecoderImpl::section_width() const {
@@ -1592,12 +1604,14 @@ int DecoderImpl::section_height() const {
 
 void DecoderImpl::SetAbsoluteActivePos(int x, int y) {
     active_pos_inited_ = true;
+    active_pos_pending_wrap_ = false;
     active_pos_x_ = display_area_start_x_ + x * section_width();
     active_pos_y_ = display_area_start_y_ + (y + 1) * section_height();
 }
 
 void DecoderImpl::SetAbsoluteActiveCoordinateDot(int x, int y) {
     active_pos_inited_ = true;
+    active_pos_pending_wrap_ = false;
     active_pos_x_ = x;
     active_pos_y_ = y;
 }
@@ -1608,6 +1622,7 @@ void DecoderImpl::MoveRelativeActivePos(int x, int y) {
     }
 
     active_pos_inited_ = true;
+    ApplyPendingWrap();
 
     while (x < 0) {
         active_pos_x_ -= section_width();
@@ -1622,6 +1637,11 @@ void DecoderImpl::MoveRelativeActivePos(int x, int y) {
         active_pos_x_ += section_width();
         x--;
         if (active_pos_x_ >= display_area_start_x_ + display_area_width_) {
+            if (x == 0) {
+                // Reached the end of line, defer wrapping until the next character or movement
+                active_pos_pending_wrap_ = true;
+                break;
+            }
             active_pos_x_ = display_area_start_x_;
             y++;
         }
@@ -1650,8 +1670,21 @@ void DecoderImpl::MoveActivePosToNewline() {
     }
 
     active_pos_inited_ = true;
+    // APR: Active position down (APD) with moving to the first position of the line
+    // A pending wrap is consumed here, so a full line followed by APR moves down only once
+    active_pos_pending_wrap_ = false;
     active_pos_x_ = display_area_start_x_;
-    active_pos_y_ += section_height();
+    MoveRelativeActivePos(0, 1);
+}
+
+void DecoderImpl::ApplyPendingWrap() {
+    if (!active_pos_pending_wrap_) {
+        return;
+    }
+
+    active_pos_pending_wrap_ = false;
+    active_pos_x_ = display_area_start_x_;
+    MoveRelativeActivePos(0, 1);
 }
 
 

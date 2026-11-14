@@ -41,7 +41,8 @@ FontProviderType FontProviderAndroid::GetType() {
 }
 
 bool FontProviderAndroid::Initialize() {
-    base_font_path_ = getenv("ANDROID_ROOT");
+    const char* android_root = getenv("ANDROID_ROOT");
+    base_font_path_ = android_root ? android_root : "/system";
     base_font_path_.append("/fonts/");
 
     bool ret = ParseAndroidSystemFonts();
@@ -52,35 +53,44 @@ void FontProviderAndroid::SetLanguage(uint32_t iso6392_language_code) {
     iso6392_language_code_ = iso6392_language_code;
 }
 
+// Pick the font closest to Regular: prefer upright fonts, then the weight nearest to 400
+// Families like "sans-serif-medium" (alias with weight="500") contain no weight 400 font
+static FontFile* FindRegularFont(FontFamily& family) {
+    FontFile* best = nullptr;
+    int best_score = 0;
+
+    for (auto& font : family.fonts) {
+        int score = std::abs(font.weight - 400) + (font.is_italic ? 1000 : 0);
+        if (!best || score < best_score) {
+            best = &font;
+            best_score = score;
+        }
+    }
+
+    return best;
+}
+
 auto FontProviderAndroid::GetFontFace(const std::string &font_name,
                                       std::optional<uint32_t> ucs4) -> Result<FontfaceInfo, FontProviderError> {
-    FontFile* font_file = nullptr;
+    FontFamily* family = nullptr;
 
     if (iso6392_language_code_ == ThreeCC("jpn") || iso6392_language_code_ == 0) {
-        FontFamily* family = FindFallbackFamilyByLanguageAndFallbackFor("ja", font_name.c_str());
+        family = FindFallbackFamilyByLanguageAndFallbackFor("ja", font_name);
         if (!family) {
             family = FindFallbackFamilyByLanguageAndFallbackFor("ja", "sans-serif");
         }
-        if (!family) {
-            return Err(FontProviderError::kFontNotFound);
-        }
-        for (auto& font : family->fonts) {
-            if (font.weight == 400 && !font.is_italic) {
-                font_file = &font;
-                break;
-            }
-        }
     } else {
-        FontFamily* family = FindFamilyByName(font_name.c_str());
-        if (!family) {
-            return Err(FontProviderError::kFontNotFound);
-        }
-        for (auto& font : family->fonts) {
-            if (font.weight == 400 && !font.is_italic) {
-                font_file = &font;
-                break;
-            }
-        }
+        family = FindFamilyByName(font_name);
+    }
+
+    if (!family) {
+        return Err(FontProviderError::kFontNotFound);
+    }
+
+    FontFile* font_file = FindRegularFont(*family);
+    if (!font_file) {
+        log_->w("FontProviderAndroid: Font family %s contains no font file", font_name.c_str());
+        return Err(FontProviderError::kFontNotFound);
     }
 
     FontfaceInfo info;
@@ -93,7 +103,7 @@ auto FontProviderAndroid::GetFontFace(const std::string &font_name,
     return Ok(std::move(info));
 }
 
-FontFamily* FontProviderAndroid::FindFamilyByName(const char *search_name) {
+FontFamily* FontProviderAndroid::FindFamilyByName(std::string_view search_name) {
     for (auto& family : font_families_) {
         for (auto& name : family.names) {
             if (name == search_name) {
@@ -105,8 +115,8 @@ FontFamily* FontProviderAndroid::FindFamilyByName(const char *search_name) {
     return nullptr;
 }
 
-FontFamily* FontProviderAndroid::FindFallbackFamilyByLanguageAndFallbackFor(const char* lang,
-                                                                            const char *fallback_for) {
+FontFamily* FontProviderAndroid::FindFallbackFamilyByLanguageAndFallbackFor(std::string_view lang,
+                                                                            std::string_view fallback_for) {
     for (auto& family : font_families_) {
         if (!family.is_fallback) {
             continue;
@@ -210,7 +220,7 @@ bool FontProviderAndroid::PrepareFontsForGingerbread() {
     return true;
 }
 
-static bool AnnotateJAForSpecificFontFile(std::vector<FontFamily>& font_families, const char* font_filename) {
+static bool AnnotateJAForSpecificFontFile(std::vector<FontFamily>& font_families, std::string_view font_filename) {
     bool detected_filename = false;
 
     for (auto& family : font_families) {
@@ -266,6 +276,10 @@ bool FontProviderAndroid::ParseFontsXML(const char *xml_path) {
     }
 
     XMLElement* root = doc.RootElement();
+    if (!root) {
+        log_->e("FontProviderAndroid: Root element not found in %s", xml_path);
+        return false;
+    }
     if (strcmp(root->Name(), "familyset") != 0) {
         log_->e("FontProviderAndroid: Root element must be familyset, found %s", root->Name());
         return false;
@@ -378,8 +392,7 @@ bool FontProviderAndroid::LMPHandleFont(XMLElement* element, internal::FontFamil
         }
 
         FontFamily* fallback_family =
-                FindFallbackFamilyByLanguageAndFallbackFor(family.languages[0].c_str(),
-                                                           fallback_for);
+                FindFallbackFamilyByLanguageAndFallbackFor(family.languages[0], fallback_for);
         if (!fallback_family) {
             FontFamily& new_fallback_family = font_families_.emplace_back();
             new_fallback_family.languages = family.languages;
@@ -398,19 +411,19 @@ bool FontProviderAndroid::LMPHandleFont(XMLElement* element, internal::FontFamil
 }
 
 bool FontProviderAndroid::LMPHandleAlias(tinyxml2::XMLElement* element) {
-    if (!element->FindAttribute("name") | !element->FindAttribute("to")) {
+    if (!element->FindAttribute("name") || !element->FindAttribute("to")) {
         log_->e("FontProviderAndroid: Missing name/to for alias in fonts.xml");
         return false;
     }
 
     if (const XMLAttribute* weight_attr = element->FindAttribute("weight")) {
-        FontFamily& new_family = font_families_.emplace_back();
         FontFamily* target_family = FindFamilyByName(element->Attribute("to"));
         if (!target_family) {
             log_->e("FontProviderAndroid: Alias target not found: %s", element->Attribute("to"));
             return false;
         }
 
+        FontFamily new_family;
         new_family.names = {element->Attribute("name")};
         new_family.languages = target_family->languages;
         new_family.variant = target_family->variant;
@@ -424,6 +437,8 @@ bool FontProviderAndroid::LMPHandleAlias(tinyxml2::XMLElement* element) {
                 new_family.fonts.push_back(font);
             }
         }
+
+        font_families_.push_back(std::move(new_family));
     } else {
         FontFamily* target_family = FindFamilyByName(element->Attribute("to"));
         if (!target_family) {
@@ -480,7 +495,9 @@ bool FontProviderAndroid::JBHandleNameset(XMLElement* element, FontFamily& famil
     element = element->FirstChildElement();
     while (element) {
         if (strcmp(element->Name(), "name") == 0) {
-            family.names.emplace_back(element->GetText());
+            if (const char* name = element->GetText()) {
+                family.names.emplace_back(name);
+            }
         }
         element = element->NextSiblingElement();
     }
@@ -500,8 +517,13 @@ bool FontProviderAndroid::JBHandleFileset(XMLElement* element, FontFamily& famil
 }
 
 bool FontProviderAndroid::JBHandleFile(XMLElement* element, FontFamily& family) {
+    const char* filename = element->GetText();
+    if (!filename) {
+        return true;  // Skip <file> without filename
+    }
+
     FontFile& font = family.fonts.emplace_back();
-    font.filename = element->GetText();
+    font.filename = filename;
 
     std::string filename_lcase(font.filename.length(), 0);
     std::transform(font.filename.begin(),

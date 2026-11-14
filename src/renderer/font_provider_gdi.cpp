@@ -17,6 +17,7 @@
  */
 
 #include <windows.h>
+#include <string_view>
 #include <vector>
 #include "base/utf_helper.hpp"
 #include "base/wchar_helper.hpp"
@@ -44,8 +45,9 @@ void FontProviderGDI::SetLanguage(uint32_t iso6392_language_code) {
     iso6392_language_code_ = iso6392_language_code;
 }
 
-static std::string ConvertFamilyName(const std::string& family_name, uint32_t iso6392_language_code) {
-    std::string font_name = family_name;
+// The returned view refers to either family_name or a string literal
+static std::string_view ConvertFamilyName(std::string_view family_name, uint32_t iso6392_language_code) {
+    std::string_view font_name = family_name;
 
     if (family_name == "sans-serif") {
         if (iso6392_language_code == ThreeCC("jpn")) {
@@ -134,7 +136,7 @@ static bool CheckCodePointExists(HDC hdc, uint32_t ucs4) {
 
 auto FontProviderGDI::GetFontFace(const std::string& font_name, std::optional<uint32_t> ucs4)
         -> Result<FontfaceInfo, FontProviderError> {
-    std::string converted_family_name = ConvertFamilyName(font_name, iso6392_language_code_);
+    std::string_view converted_family_name = ConvertFamilyName(font_name, iso6392_language_code_);
     std::wstring wide_font_name = wchar::UTF8ToWideString(converted_family_name);
 
     LOGFONTW lf{};
@@ -168,11 +170,18 @@ auto FontProviderGDI::GetFontFace(const std::string& font_name, std::optional<ui
     info.provider_type = FontProviderType::kGDI;
 
     ScopedHolder<HFONT> hfont(CreateFontIndirectW(&lf), [](HFONT obj) { DeleteObject(obj); });
-    SelectObject(hdc_, hfont);
+    if (!hfont) {
+        log_->e("FontProviderGDI: CreateFontIndirectW() failed");
+        return Err(FontProviderError::kOtherError);
+    }
+
+    // Restore the previously selected font before hfont is deleted,
+    // a font must not be deleted while it's still selected into a DC
+    HGDIOBJ prev_font = SelectObject(hdc_, hfont);
 
     if (ucs4.has_value()) {
         if (!CheckCodePointExists(hdc_, ucs4.value())) {
-            SelectObject(hdc_, nullptr);
+            SelectObject(hdc_, prev_font);
             return Err(FontProviderError::kCodePointNotFound);
         }
     }
@@ -180,7 +189,7 @@ auto FontProviderGDI::GetFontFace(const std::string& font_name, std::optional<ui
     bool is_ttc = false;
     bool succ = RetrieveFontData(hdc_, info.font_data, is_ttc);
     if (!succ || info.font_data.empty()) {
-        SelectObject(hdc_, nullptr);
+        SelectObject(hdc_, prev_font);
         return Err(FontProviderError::kOtherError);
     }
 
@@ -188,7 +197,7 @@ auto FontProviderGDI::GetFontFace(const std::string& font_name, std::optional<ui
         info.face_index = -1;
     }  // else: face_index = 0
 
-    SelectObject(hdc_, nullptr);
+    SelectObject(hdc_, prev_font);
     return Ok(std::move(info));
 }
 
