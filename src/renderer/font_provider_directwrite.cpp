@@ -18,13 +18,108 @@
 
 #include <windows.h>
 #include <initguid.h>
+#include <optional>
 #include <string_view>
+#include "base/unicode_helper.hpp"
+#include "base/utf_helper.hpp"
 #include "base/wchar_helper.hpp"
 #include "renderer/font_provider_directwrite.hpp"
 
 namespace aribcaption {
 
 constexpr IID IID_IDWriteFactory = {0xb859ee5a, 0xd838, 0x4b5b, {0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48}};
+
+namespace {
+
+class SingleCharTextAnalysisSource final : public IDWriteTextAnalysisSource {
+public:
+    SingleCharTextAnalysisSource(const WCHAR* text, UINT32 text_length, const WCHAR* locale_name)
+        : text_(text), text_length_(text_length), locale_name_(locale_name) {}
+
+    IFACEMETHOD(GetTextAtPosition)(UINT32 text_position, const WCHAR** text_string, UINT32* text_length) override {
+        if (text_position >= text_length_) {
+            *text_string = nullptr;
+            *text_length = 0;
+        } else {
+            *text_string = text_ + text_position;
+            *text_length = text_length_ - text_position;
+        }
+        return S_OK;
+    }
+
+    IFACEMETHOD(GetTextBeforePosition)(UINT32 text_position, const WCHAR** text_string, UINT32* text_length) override {
+        if (text_position == 0 || text_position > text_length_) {
+            *text_string = nullptr;
+            *text_length = 0;
+        } else {
+            *text_string = text_;
+            *text_length = text_position;
+        }
+        return S_OK;
+    }
+
+    IFACEMETHOD_(DWRITE_READING_DIRECTION, GetParagraphReadingDirection)() override {
+        return DWRITE_READING_DIRECTION_LEFT_TO_RIGHT;
+    }
+
+    IFACEMETHOD(GetLocaleName)(UINT32 text_position, UINT32* text_length, const WCHAR** locale_name) override {
+        *text_length = text_position < text_length_ ? (text_length_ - text_position) : 0;
+        *locale_name = locale_name_;
+        return S_OK;
+    }
+
+    IFACEMETHOD(GetNumberSubstitution)(UINT32 text_position,
+                                       UINT32* text_length,
+                                       IDWriteNumberSubstitution** number_substitution) override {
+        *text_length = text_position < text_length_ ? (text_length_ - text_position) : 0;
+        *number_substitution = nullptr;
+        return S_OK;
+    }
+
+    IFACEMETHOD_(ULONG, AddRef)() override {
+        return InterlockedIncrement(&ref_count_);
+    }
+
+    IFACEMETHOD_(ULONG, Release)() override {
+        ULONG result = InterlockedDecrement(&ref_count_);
+        if (result == 0) {
+            delete this;
+            return 0;
+        }
+        return result;
+    }
+
+    IFACEMETHOD(QueryInterface)(IID const& riid, void** ppv_object) override {
+        if (riid == __uuidof(IDWriteTextAnalysisSource) || riid == __uuidof(IUnknown)) {
+            *ppv_object = this;
+            AddRef();
+            return S_OK;
+        }
+        *ppv_object = nullptr;
+        return E_NOINTERFACE;
+    }
+private:
+    ULONG ref_count_ = 0;
+    const WCHAR* text_ = nullptr;
+    UINT32 text_length_ = 0;
+    const WCHAR* locale_name_ = L"";
+};
+
+const wchar_t* ISO6392ToWindowsLocaleName(uint32_t iso6392_language_code) {
+    switch (iso6392_language_code) {
+        case ThreeCC("por"):
+            return L"pt-BR";
+        case ThreeCC("spa"):
+            return L"es-CL";
+        case ThreeCC("eng"):
+            return L"en";
+        case ThreeCC("jpn"):
+        default:
+            return L"ja-JP";
+    }
+}
+
+}  // namespace
 
 FontProviderDirectWrite::FontProviderDirectWrite(Context& context) : log_(GetContextLogger(context)) {}
 
@@ -45,6 +140,12 @@ bool FontProviderDirectWrite::Initialize() {
     if (FAILED(hr)) {
         log_->e("FontProviderDirectWrite: Failed to retrieve IDWriteGdiInterop");
         return false;
+    }
+
+    // IDWriteFactory2 / IDWriteFontFallback requires Windows 8.1+; degrade gracefully on Windows 7
+    ComPtr<IDWriteFactory2> dwrite_factory2;
+    if (SUCCEEDED(dwrite_factory_.As(&dwrite_factory2)) && dwrite_factory2) {
+        dwrite_factory2->GetSystemFontFallback(&dwrite_font_fallback_);
     }
 
     return true;
@@ -134,32 +235,107 @@ static std::string DWriteLocalizedStringsToUTF8(IDWriteLocalizedStrings* strs,
     return u8str;
 }
 
-auto FontProviderDirectWrite::GetFontFace(const std::string& font_name,
-                                          std::optional<uint32_t> ucs4) -> Result<FontfaceInfo, FontProviderError> {
+auto FontProviderDirectWrite::GetFontFace(const std::string& font_name) -> Result<FontfaceInfo, FontProviderError> {
     std::string_view converted_family_name = ConvertFamilyName(font_name, iso6392_language_code_);
     std::wstring wide_font_name = wchar::UTF8ToWideString(converted_family_name);
 
-    LOGFONTW lf = {0};
-    if (wide_font_name.length() >= std::size(lf.lfFaceName)) {
-        return Err(FontProviderError::kFontNotFound);
-    }
-    wcscpy_s(lf.lfFaceName, wide_font_name.c_str());
-    lf.lfWeight = FW_NORMAL;
-    lf.lfCharSet = DEFAULT_CHARSET;
-    lf.lfOutPrecision = OUT_TT_PRECIS;
-    lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
-    lf.lfQuality = ANTIALIASED_QUALITY;
-    lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
-
     ComPtr<IDWriteFont> dwrite_font;
-    HRESULT hr = dwrite_gdi_interop_->CreateFontFromLOGFONT(&lf, &dwrite_font);
-    if (FAILED(hr)) {
-        log_->e("FontProviderDirectWrite: IDWriteGdiInterop::CreateFontFromLOGFONT() failed");
+    ComPtr<IDWriteFontCollection> system_collection;
+    HRESULT hr = dwrite_factory_->GetSystemFontCollection(&system_collection, FALSE);
+    if (SUCCEEDED(hr) && system_collection) {
+        UINT32 family_index = 0;
+        BOOL family_exists = FALSE;
+        hr = system_collection->FindFamilyName(wide_font_name.c_str(), &family_index, &family_exists);
+        if (SUCCEEDED(hr) && family_exists) {
+            ComPtr<IDWriteFontFamily> family;
+            hr = system_collection->GetFontFamily(family_index, &family);
+            if (SUCCEEDED(hr) && family) {
+                family->GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL,
+                                             DWRITE_FONT_STRETCH_NORMAL,
+                                             DWRITE_FONT_STYLE_NORMAL,
+                                             &dwrite_font);
+            }
+        }
+    }
+
+    // Fall back to GDI LOGFONT lookup for GDI-only or subfamily names
+    if (!dwrite_font && wide_font_name.length() < LF_FACESIZE) {
+        LOGFONTW lf = {0};
+        wcscpy_s(lf.lfFaceName, wide_font_name.c_str());
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        lf.lfOutPrecision = OUT_TT_PRECIS;
+        lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+        lf.lfQuality = ANTIALIASED_QUALITY;
+        lf.lfPitchAndFamily = DEFAULT_PITCH | FF_DONTCARE;
+        dwrite_gdi_interop_->CreateFontFromLOGFONT(&lf, &dwrite_font);
+    }
+
+    if (!dwrite_font) {
+        log_->w("FontProviderDirectWrite: Cannot find font %s", font_name.c_str());
         return Err(FontProviderError::kFontNotFound);
     }
 
+    return BuildFontfaceInfo(std::move(dwrite_font));
+}
+
+auto FontProviderDirectWrite::GetFallbackFontFace(uint32_t ucs4, std::string_view base_family_name)
+    -> Result<FontfaceInfo, FontProviderError> {
+    if (ucs4 == 0 || unicode::IsPrivateUseArea(ucs4) || !dwrite_font_fallback_) {
+        return Err(FontProviderError::kCodePointNotFound);
+    }
+
+    std::u16string utf16;
+    size_t codeunit_count = utf::UTF16AppendCodePoint(utf16, ucs4);
+    const wchar_t* locale_name = ISO6392ToWindowsLocaleName(iso6392_language_code_);
+
+    std::wstring wide_base_family;
+    if (!base_family_name.empty()) {
+        std::string_view converted = ConvertFamilyName(base_family_name, iso6392_language_code_);
+        wide_base_family = wchar::UTF8ToWideString(converted);
+    }
+
+    ComPtr<SingleCharTextAnalysisSource> source(new SingleCharTextAnalysisSource(
+        reinterpret_cast<const WCHAR*>(utf16.data()),
+        static_cast<UINT32>(codeunit_count),
+        locale_name));
+
+    UINT32 mapped_length = 0;
+    ComPtr<IDWriteFont> mapped_font;
+    FLOAT scale = 1.0f;
+    HRESULT hr = dwrite_font_fallback_->MapCharacters(
+        source.Get(),
+        0,
+        static_cast<UINT32>(codeunit_count),
+        nullptr,
+        wide_base_family.empty() ? nullptr : wide_base_family.c_str(),
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        &mapped_length,
+        &mapped_font,
+        &scale);
+    if (FAILED(hr) || !mapped_font || mapped_length == 0) {
+        return Err(FontProviderError::kCodePointNotFound);
+    }
+
+    BOOL has_char = FALSE;
+    hr = mapped_font->HasCharacter(ucs4, &has_char);
+    if (FAILED(hr) || !has_char) {
+        return Err(FontProviderError::kCodePointNotFound);
+    }
+
+    auto result = BuildFontfaceInfo(std::move(mapped_font));
+    if (result.is_ok() && scale > 0.0f) {
+        static_cast<FontfaceInfoPrivateDirectWrite*>(result.value().provider_priv.get())->scale = scale;
+    }
+    return result;
+}
+
+auto FontProviderDirectWrite::BuildFontfaceInfo(ComPtr<IDWriteFont> dwrite_font)
+    -> Result<FontfaceInfo, FontProviderError> {
     ComPtr<IDWriteFontFamily> dwrite_font_family;
-    hr = dwrite_font->GetFontFamily(&dwrite_font_family);
+    HRESULT hr = dwrite_font->GetFontFamily(&dwrite_font_family);
     if (FAILED(hr)) {
         log_->e("FontProviderDirectWrite: IDWriteFont::GetFontFamily() failed");
         return Err(FontProviderError::kOtherError);
@@ -172,16 +348,6 @@ auto FontProviderDirectWrite::GetFontFace(const std::string& font_name,
         return Err(FontProviderError::kOtherError);
     }
 
-    // Check whether the font contains the requested Unicode codepoint
-    if (ucs4.has_value()) {
-        BOOL ucs4_exists = FALSE;
-        hr = dwrite_font->HasCharacter(ucs4.value(), &ucs4_exists);
-        if (FAILED(hr) || !ucs4_exists) {
-            log_->w("FontProviderDirectWrite: Font %s doesn't contain U+%04X", font_name.c_str(), ucs4.value());
-            return Err(FontProviderError::kCodePointNotFound);
-        }
-    }
-
     // Retrieve Font family name
     BOOL exists = FALSE;
     ComPtr<IDWriteLocalizedStrings> localized_family_names;
@@ -191,14 +357,13 @@ auto FontProviderDirectWrite::GetFontFace(const std::string& font_name,
         return Err(FontProviderError::kOtherError);
     }
 
-    // Retrieve Font PostScript name
+    std::string postscript_name;
     ComPtr<IDWriteLocalizedStrings> localized_postscript_names;
     hr = dwrite_font->GetInformationalStrings(DWRITE_INFORMATIONAL_STRING_POSTSCRIPT_NAME,
                                               &localized_postscript_names,
                                               &exists);
-    if (FAILED(hr) || !exists) {
-        log_->w("FontProviderDirectWrite: Retrieve font PostScript name failed");
-        return Err(FontProviderError::kOtherError);
+    if (SUCCEEDED(hr) && exists && localized_postscript_names) {
+        postscript_name = DWriteLocalizedStringsToUTF8(localized_postscript_names.Get(), 0);
     }
 
     // Retrieve Font filename
@@ -252,7 +417,7 @@ auto FontProviderDirectWrite::GetFontFace(const std::string& font_name,
     FontfaceInfo fontface_info;
     fontface_info.filename = wchar::WideStringToUTF8(file_path);
     fontface_info.family_name = DWriteLocalizedStringsToUTF8(localized_family_names.Get());
-    fontface_info.postscript_name = DWriteLocalizedStringsToUTF8(localized_postscript_names.Get(), 0);
+    fontface_info.postscript_name = std::move(postscript_name);
     fontface_info.face_index = static_cast<int>(dwrite_fontface->GetIndex());
     fontface_info.provider_type = FontProviderType::kDirectWrite;
 

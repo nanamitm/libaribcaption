@@ -21,9 +21,10 @@
 
 #include <wrl/client.h>
 #include <d2d1.h>
-#include <dwrite.h>
+#include <dwrite_2.h>
 #include <wincodec.h>
 #include <optional>
+#include <unordered_set>
 #include "aribcaption/context.hpp"
 #include "base/scoped_com_initializer.hpp"
 #include "renderer/font_provider.hpp"
@@ -50,10 +51,25 @@ public:
                   std::optional<UnderlineInfo> underline_info,
                   TextRenderFallbackPolicy fallback_policy) -> TextRenderStatus override;
 private:
-    auto LoadDWriteFont(std::optional<uint32_t> codepoint = std::nullopt,
-                        std::optional<size_t> begin_index = std::nullopt)
-        -> Result<std::pair<FontfaceInfo, size_t>, FontProviderError>;
-    auto CreateDWriteTextFormat(FontfaceInfo& face_info, int font_size) -> ComPtr<IDWriteTextFormat>;
+    enum class SlotState {
+        kUnloaded,
+        kLoaded,
+        kUnavailable
+    };
+
+    struct FontSlot {
+        SlotState state = SlotState::kUnloaded;
+        FontfaceInfo faceinfo;
+        ComPtr<IDWriteTextFormat> text_format;
+        int pixel_height = 0;
+    };
+private:
+    bool IsDuplicateFont(const FontfaceInfo& info) const;
+    auto LoadSlot(size_t slot_index) -> std::optional<FontProviderError>;
+    auto EnsureMainSlot() -> std::optional<FontProviderError>;
+    auto FindOrLoadSystemFallbackSlot(uint32_t ucs4, std::string_view base_family_name) -> FontSlot*;
+    auto EnsureTextFormat(FontSlot& slot, int char_height) -> IDWriteTextFormat*;
+    auto CreateDWriteTextFormat(FontfaceInfo& face_info, float font_size) -> ComPtr<IDWriteTextFormat>;
     auto CreateWICRenderTarget(IWICBitmap* target) -> ComPtr<ID2D1RenderTarget>;
     bool BlendWICBitmapToBitmap(IWICBitmap* wic_bitmap, Bitmap& target_bmp,
                                 int target_x, int target_y);
@@ -73,17 +89,13 @@ private:
     ComPtr<IWICImagingFactory> wic_factory_;
     ComPtr<ID2D1Factory> d2d_factory_;
     ComPtr<ID2D1StrokeStyle> stroke_style_;
+    ComPtr<IDWriteFontFallback> no_fallback_;  // Empty fallback, null on Windows 7
 
-    size_t main_face_index_ = 0;
-
-    std::optional<FontfaceInfo> main_faceinfo_;
-    std::optional<FontfaceInfo> fallback_faceinfo_;
-
-    int main_text_format_pixel_height_ = 0;
-    int fallback_text_format_pixel_height_ = 0;
-
-    ComPtr<IDWriteTextFormat> main_text_format_;
-    ComPtr<IDWriteTextFormat> fallback_text_format_;
+    std::vector<FontSlot> font_slots_;
+    std::vector<FontSlot> system_fallback_slots_;
+    std::optional<size_t> main_slot_index_;
+    FontProviderError main_load_error_ = FontProviderError::kFontNotFound;
+    std::unordered_set<uint32_t> missing_codepoints_;
 
     bool replace_msz_halfwidth_glyph_ = true;
 };

@@ -21,9 +21,9 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
-#include <optional>
 #include "aribcaption/context.hpp"
 #include "aribcaption/renderer.hpp"
 #include "base/result.hpp"
@@ -62,8 +62,9 @@ public:
     virtual FontProviderType GetType() = 0;
     virtual bool Initialize() = 0;
     virtual void SetLanguage(uint32_t iso6392_language_code) = 0;
-    virtual Result<FontfaceInfo, FontProviderError> GetFontFace(const std::string& font_name,
-                                                                std::optional<uint32_t> ucs4) = 0;
+    virtual Result<FontfaceInfo, FontProviderError> GetFontFace(const std::string& font_name) = 0;
+    virtual Result<FontfaceInfo, FontProviderError> GetFallbackFontFace(uint32_t ucs4,
+                                                                        std::string_view base_family_name);
 public:
     // Disallow copy and assign
     FontProvider(const FontProvider&) = delete;
